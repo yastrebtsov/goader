@@ -3,6 +3,8 @@ package main
 import (
 	"flag"
 	"fmt"
+	"github.com/aws/aws-sdk-go/service/s3/s3manager"
+	"net/url"
 	"os"
 	"os/signal"
 	"sort"
@@ -112,6 +114,11 @@ var config struct {
 	S3Region               string
 	S3SecretKey            string
 	S3SignatureVersion     int
+	S3UseUploader          bool
+	S3PartSizeInput        string
+	S3PartSize             int64
+	S3UlConcurrency        int
+	S3DlConcurrency        int
 	timelineFile           string
 	seed                   int64
 	writeGoodUrls          bool
@@ -373,20 +380,39 @@ func getOperators(progress *Progress) *Operators {
 		operators.writeRequster = newHTTPRequester(progress.writes, &nullAuther{})
 		operators.readRequester = newHTTPRequester(progress.reads, &nullAuther{})
 	case S3:
+		u, err := url.Parse(config.S3Endpoint)
+		if err != nil {
+			log.Fatalln("Failed to parse S3 endpoint: ", err)
+		}
+
+		if u.Scheme == "" {
+			u.Scheme = "http"
+		}
+
 		s3params := s3Params{
-			secretKey: config.S3SecretKey,
-			apiKey:    config.S3ApiKey,
-			bucket:    config.S3Bucket,
-			endpoint:  config.S3Endpoint,
+			secretKey:     config.S3SecretKey,
+			apiKey:        config.S3ApiKey,
+			bucket:        config.S3Bucket,
+			endpoint:      u.String(),
+			region:        config.S3Region,
+			partSize:      config.S3PartSize,
+			dlConcurrency: config.S3DlConcurrency,
+			ulConcurrency: config.S3UlConcurrency,
 		}
-		var s3Auther S3Auther
-		if config.S3SignatureVersion == 4 {
-			s3Auther = &s3AutherV4{s3params}
+
+		if config.S3UseUploader {
+			operators.writeRequster = newS3UploaderRequester(progress.writes, s3params)
+			operators.readRequester = newS3UploaderRequester(progress.reads, s3params)
 		} else {
-			s3Auther = &s3AutherV2{s3params}
+			var s3Auther S3Auther
+			if config.S3SignatureVersion == 4 {
+				s3Auther = &s3AutherV4{s3params}
+			} else {
+				s3Auther = &s3AutherV2{s3params}
+			}
+			operators.writeRequster = newHTTPRequester(progress.writes, s3Auther)
+			operators.readRequester = newHTTPRequester(progress.reads, s3Auther)
 		}
-		operators.writeRequster = newHTTPRequester(progress.writes, s3Auther)
-		operators.readRequester = newHTTPRequester(progress.reads, s3Auther)
 	case Disk:
 		operators.writeRequster = newDiskRequester(progress.writes)
 		operators.readRequester = newDiskRequester(progress.reads)
@@ -770,6 +796,10 @@ func configure() {
 	flag.StringVar(&config.S3Endpoint, "s3-endpoint", EmptyString, "S3 endpoint")
 	flag.StringVar(&config.S3Region, "s3-region", NotSetString, "S3 region, must be set for V4 signature")
 	flag.IntVar(&config.S3SignatureVersion, "s3-sign-ver", 4, "S3 signature version, defaults to 4, supports 2/4")
+	flag.BoolVar(&config.S3UseUploader, "s3-use-uploader", false, "Use multi-part uploader API for S3 requests")
+	flag.IntVar(&config.S3UlConcurrency, "s3-ul-concurrency", s3manager.DefaultUploadConcurrency, "S3 multi-part uploader concurrency, defaults to 5")
+	flag.IntVar(&config.S3DlConcurrency, "s3-dl-concurrency", s3manager.DefaultDownloadConcurrency, "S3 multi-part downloader concurrency, defaults to 5")
+	flag.StringVar(&config.S3PartSizeInput, "s3-part-size", "5Mib", "Part size for S3 multi-part requests, in bytes.")
 	flag.StringVar(&config.outputFormat, "output", FormatHuman, "Output format(human/json), defaults to human")
 	flag.StringVar(&config.writtenUrlsDump, "written-urls-dump", EmptyString, "Path to dump written files, so then can rerun as reads job")
 	flag.BoolVar(&config.showProgress, "show-progress", true, "Displays progress as dots")
@@ -791,6 +821,9 @@ func configure() {
 		config.url = flag.Args()[0]
 	}
 
+	ps, err := humanize.ParseBytes(config.S3PartSizeInput)
+	config.S3PartSize = int64(ps)
+
 	if err != nil {
 		fmt.Println(err.Error())
 	}
@@ -802,12 +835,14 @@ func configure() {
 	configureMode()
 	configureGoodUrlsStore()
 	n, err := randc.Int(randc.Reader, big.NewInt(1<<63-1))
+	if err != nil {
+		log.Fatalln("randc error: ", err)
+	}
 	if config.seed == NotSet {
 		rand.Seed(n.Int64())
 	} else {
 		rand.Seed(config.seed)
 	}
-
 }
 
 func configureGoodUrlsStore() {

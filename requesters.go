@@ -1,10 +1,15 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"errors"
 	"fmt"
-	"github.com/tigrawap/goader/ops"
+	"io"
+	"log"
 	"math/rand"
+	"os"
+	"path"
 	"strconv"
 	"time"
 
@@ -13,10 +18,15 @@ import (
 	randc "crypto/rand"
 	"github.com/tigrawap/goader/utils"
 	"github.com/valyala/fasthttp"
-	"io"
-	"log"
-	"os"
-	"path"
+
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/awserr"
+	"github.com/aws/aws-sdk-go/aws/credentials"
+	aws_req "github.com/aws/aws-sdk-go/aws/request"
+	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/aws/aws-sdk-go/service/s3/s3manager"
+	"github.com/tigrawap/goader/ops"
 )
 
 type nullRequester struct {
@@ -167,10 +177,13 @@ func (requester *diskRequester) doRequest(responses chan *Response, request *Req
 		}
 	} else {
 		if fd, err := os.OpenFile(filename, os.O_RDONLY, 0644); err == nil {
+			defer fd.Close()
 			if fi, err := fd.Stat(); err == nil {
 				size := fi.Size()
-				fd.Read(requestersConfig.scratchBufferGetter.GetBuffer(size))
-				fd.Close()
+				_, err = fd.Read(requestersConfig.scratchBufferGetter.GetBuffer(size))
+				if err != nil {
+					log.Printf("Read failed: %v\n", err)
+				}
 			}
 		}
 	}
@@ -314,4 +327,146 @@ func newMetaRequester(state *OPState) *metaRequester {
 
 func getXattrName() string {
 	return "user.goader.xattr-" + strconv.Itoa(rand.Intn(config.metaXattrKeys))
+}
+
+type s3UploaderRequester struct {
+	client  fasthttp.Client
+	timeout time.Duration
+	method  func(r *Request) (time.Duration, error)
+	state   *OPState
+	s3      *s3.S3
+	bucket  string
+}
+
+func newS3UploaderRequester(state *OPState, params s3Params) *s3UploaderRequester {
+	svc := s3.New(session.Must(session.NewSession(&aws.Config{
+		Credentials:      credentials.NewStaticCredentials(params.apiKey, params.secretKey, ""),
+		Endpoint:         aws.String(params.endpoint),
+		Region:           aws.String(params.region),
+		S3ForcePathStyle: aws.Bool(true),
+	})))
+
+	requester := s3UploaderRequester{
+		state:  state,
+		s3:     svc,
+		bucket: params.bucket,
+	}
+
+	requester.state = state
+	if state.op == WRITE {
+		uploader := s3manager.NewUploaderWithClient(svc, func(u *s3manager.Uploader) {
+			u.PartSize = params.partSize         // 64MB per part
+			u.LeavePartsOnError = false          // Don't delete the parts if the upload fails.
+			u.Concurrency = params.ulConcurrency // s3manager.DefaultUploadConcurrency
+		})
+
+		requester.method = func(r *Request) (time.Duration, error) { return requester.upload(uploader, r) }
+	} else {
+		downloader := s3manager.NewDownloaderWithClient(svc, func(d *s3manager.Downloader) {
+			d.PartSize = params.partSize
+			d.Concurrency = params.dlConcurrency
+		})
+
+		requester.method = func(r *Request) (time.Duration, error) { return requester.download(downloader, r) }
+	}
+
+	if config.maxLatency == NotSet {
+		requester.timeout = 60 * time.Second
+	} else {
+		requester.timeout = 5 * config.maxLatency
+	}
+
+	return &requester
+}
+
+func (r *s3UploaderRequester) upload(uploader *s3manager.Uploader, request *Request) (time.Duration, error) {
+	upParams := &s3manager.UploadInput{
+		Bucket: aws.String(r.bucket),
+		Key:    aws.String(request.getUrl()),
+		Body:   bytes.NewReader(requestersConfig.payloadGetter.Get()),
+	}
+
+	ctx := context.Background()
+	var cancelFn func()
+	if r.timeout > 0 {
+		ctx, cancelFn = context.WithTimeout(ctx, r.timeout)
+	}
+
+	if cancelFn != nil {
+		defer cancelFn()
+	}
+
+	start := time.Now()
+	_, err := uploader.UploadWithContext(ctx, upParams)
+	if err != nil {
+		if aerr, ok := err.(awserr.Error); ok && aerr.Code() == aws_req.CanceledErrorCode {
+			// If the SDK can determine the request or retry delay was canceled
+			// by a context the CanceledErrorCode error code will be returned.
+			log.Printf("upload canceled due to timeout, %v\n", err)
+			return 0, fmt.Errorf("S3 Upload canceled: %w", err)
+		} else {
+			log.Printf("failed to upload object, %v\n", err)
+			return 0, fmt.Errorf("S3 Upload failed: %w", err)
+		}
+	}
+
+	timeSpent := time.Since(start)
+
+	return timeSpent, nil
+}
+
+func (r *s3UploaderRequester) download(downloader *s3manager.Downloader, request *Request) (time.Duration, error) {
+	dParams := &s3.GetObjectInput{
+		Bucket: aws.String(r.bucket),
+		Key:    aws.String(request.getUrl()),
+	}
+
+	ctx := context.Background()
+	var cancelFn func()
+	if r.timeout > 0 {
+		ctx, cancelFn = context.WithTimeout(ctx, r.timeout)
+	}
+
+	if cancelFn != nil {
+		defer cancelFn()
+	}
+
+	buf := aws.NewWriteAtBuffer(requestersConfig.scratchBufferGetter.GetBuffer(int64(config.bodySize)))
+
+	start := time.Now()
+	_, err := downloader.DownloadWithContext(ctx, buf, dParams)
+	if err != nil {
+		if aerr, ok := err.(awserr.Error); ok && aerr.Code() == aws_req.CanceledErrorCode {
+			// If the SDK can determine the request or retry delay was canceled
+			// by a context the CanceledErrorCode error code will be returned.
+			log.Printf("upload canceled due to timeout, %v\n", err)
+			return 0, fmt.Errorf("S3 Download canceled: %w", err)
+		} else {
+			log.Printf("failed to upload object, %v\n", err)
+			return 0, fmt.Errorf("S3 Download failed: %w", err)
+		}
+	}
+	timeSpent := time.Since(start)
+
+	return timeSpent, nil
+}
+
+func (r *s3UploaderRequester) request(responses chan *Response, request *Request) {
+	defer func() {
+		if err := recover(); err != nil { //catch
+			responses <- &Response{&Request{targeter: &BadUrlTarget{}, startTime: time.Now()}, time.Nanosecond,
+				fmt.Errorf("Error: %s,%v", "panic:", err)}
+			return
+		}
+	}()
+
+	timeSpent, err := r.method(request)
+
+	if err != nil {
+		responses <- &Response{request, timeSpent,
+			fmt.Errorf("Bad request: %s\n", err)}
+		return
+	}
+
+	responses <- &Response{request, timeSpent, nil}
 }

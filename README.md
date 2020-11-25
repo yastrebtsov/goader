@@ -95,6 +95,9 @@ Will maintain 200 read, 30 write threads
 `./goader -rt=200 -wt=0 --requests-engine=upload -url="http://127.0.0.1/post/XXXXX"`
 Same, reads only.
 
+`./goader -rps=10 -wps=10 --requests-engine=s3 --body-size=10Mib  --max-requests=100 --s3-api-key=$AWS_API_KEY --s3-secret-key=$AWS_API_SECRET --s3-endpoint=https://s3.hosting.com --s3-bucket=test  --s3-sign-ver=4 --s3-region=us-west --s3-use-uploader=1 --s3-part-size=5Mib --s3-ul-concurrency=2 --s3-dl-concurrency=2  --url=file10Mb_XXXX_RR.dat`
+Will use S3 multipart upload/download API with parts with size 5MiBs and with 2 parallel routines per one UL/DL call   
+
 In all load patterns if both reads and writes issued reads will use previously written data, if only read pattern used - then incremental filenames (or from urls list file), with reads only it is expected for files/urls to be there
 
 ##### Example output
